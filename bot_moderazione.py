@@ -11,7 +11,7 @@ from collections import defaultdict
 # ─────────────────────────────────────────
 #  CONFIGURAZIONE - MODIFICA SOLO QUESTA PARTE
 # ─────────────────────────────────────────
-TOKEN    =
+TOKEN = os.getenv("TOKEN")
 OWNER_ID = 1222812045184073750
 
 # ─────────────────────────────────────────
