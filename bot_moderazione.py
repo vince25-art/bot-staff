@@ -1069,8 +1069,7 @@ async def antispam_configura(interaction: discord.Interaction, messaggi: int, se
     await interaction.response.send_message(
         embed=discord.Embed(
             title="🛡️ Antispam configurato",
-            description=f"**Messaggi:** {messaggi} in {secondi} secondi
-**Mute automatico:** {durata_str}",
+            description=f"**Messaggi:** {messaggi} in {secondi} secondi\n**Mute automatico:** {durata_str}",
             color=discord.Color.gold()
         ),
         ephemeral=True
