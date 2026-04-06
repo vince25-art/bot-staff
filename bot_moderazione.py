@@ -11,7 +11,7 @@ from collections import defaultdict
 # ─────────────────────────────────────────
 #  CONFIGURAZIONE - MODIFICA SOLO QUESTA PARTE
 # ─────────────────────────────────────────
-TOKEN    = "IL_TUO_TOKEN_QUI"
+TOKEN    = "TOKEN"
 OWNER_IDS = [1222812045184073750, 1487162734943666399, 1406630448381165588]
 
 # ─────────────────────────────────────────
