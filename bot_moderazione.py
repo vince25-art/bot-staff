@@ -11,8 +11,8 @@ from collections import defaultdict
 # ─────────────────────────────────────────
 #  CONFIGURAZIONE - MODIFICA SOLO QUESTA PARTE
 # ─────────────────────────────────────────
-TOKEN = os.getenv("TOKEN")
-OWNER_ID = 1222812045184073750
+TOKEN    = "IL_TUO_TOKEN_QUI"
+OWNER_IDS = [1222812045184073750, 1487162734943666399, 1406630448381165588]
 
 # ─────────────────────────────────────────
 #  FILE DI SALVATAGGIO
@@ -56,7 +56,7 @@ def save_json(file, data):
         json.dump(data, f, indent=4)
 
 def is_owner(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == OWNER_ID
+    return interaction.user.id in OWNER_IDS
 
 def has_perm(interaction: discord.Interaction, perm: str) -> bool:
     """Controlla se l'utente è owner, ha il permesso Discord, o ha un ruolo abilitato."""
@@ -151,7 +151,7 @@ async def get_or_create_muted_role(guild):
     if muted_role is None:
         muted_role = await guild.create_role(name="Muted")
         for channel in guild.channels:
-            await channel.set_permissions(muted_role, send_messages=False, speak=False)
+            await channel.set_permissions(muted_role, send_messages=False, speak=False, send_messages_in_threads=False, create_public_threads=False, create_private_threads=False)
         config.setdefault(guild_id, {})["muted_role"] = muted_role.id
         save_json(CONFIG_FILE, config)
     return muted_role
@@ -238,11 +238,28 @@ async def automod_check(message: discord.Message):
     if not motivo and automod_cfg.get("antispam", False):
         now = datetime.utcnow()
         uid = str(message.author.id)
-        spam_tracker[uid] = [t for t in spam_tracker[uid] if (now - t).total_seconds() < SPAM_WINDOW]
+        spam_limit  = automod_cfg.get("spam_limit",  SPAM_LIMIT)
+        spam_window = automod_cfg.get("spam_window", SPAM_WINDOW)
+        spam_mute_duration = automod_cfg.get("spam_mute_duration", None)
+        spam_tracker[uid] = [t for t in spam_tracker[uid] if (now - t).total_seconds() < spam_window]
         spam_tracker[uid].append(now)
-        if len(spam_tracker[uid]) >= SPAM_LIMIT:
-            motivo = f"Spam rilevato ({SPAM_LIMIT} messaggi in {SPAM_WINDOW}s)"
+        if len(spam_tracker[uid]) >= spam_limit:
+            motivo = f"Spam rilevato ({spam_limit} messaggi in {spam_window}s)"
             spam_tracker[uid] = []
+            # Mute automatico con durata configurabile
+            muted_role = await get_or_create_muted_role(message.guild)
+            if muted_role not in message.author.roles:
+                await message.author.add_roles(muted_role, reason=f"[AUTOMOD] {motivo}")
+                if spam_mute_duration:
+                    secondi_mute = parse_duration(spam_mute_duration)
+                    if secondi_mute:
+                        async def unmute_after(member, role, secs):
+                            await asyncio.sleep(secs)
+                            if role in member.roles:
+                                await member.remove_roles(role, reason="Mute antispam scaduto")
+                                await send_log(message.guild, "UNMUTE", bot.user, member, reason="Mute antispam scaduto")
+                        asyncio.create_task(unmute_after(message.author, muted_role, secondi_mute))
+            return  # Esce subito dopo il mute, senza passare per il warn generico
 
     if not motivo and automod_cfg.get("anticaps", False):
         content = message.content
@@ -299,46 +316,90 @@ async def nuke_action(guild, user, action_type):
             pass
 
 # ─────────────────────────────────────────
-#  VIEW CONFERMA BAN ALL
+#  VIEW CONFERMA NUKE
 # ─────────────────────────────────────────
-class BanAllView(discord.ui.View):
-    def __init__(self):
+class NukeView(discord.ui.View):
+    def __init__(self, guild_id: int):
         super().__init__(timeout=30)
-        self.confermato = False
+        self.guild_id = guild_id
 
-    @discord.ui.button(label="✅ Conferma BAN ALL", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="☢️ CONFERMA NUKE", style=discord.ButtonStyle.danger)
     async def conferma(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ Solo il possessore del bot può confermare.", ephemeral=True)
+        if interaction.user.id not in OWNER_IDS:
+            await interaction.response.send_message("❌ Non autorizzato.", ephemeral=True)
             return
-        self.confermato = True
         self.stop()
-        await interaction.response.send_message("☢️ Ban di massa in corso...", ephemeral=True)
-
-        bannati = 0
-        errori = 0
-        async for member in interaction.guild.fetch_members():
-            if member.bot or member.id == OWNER_ID:
-                continue
-            if member.guild_permissions.administrator:
-                continue
-            try:
-                await member.ban(reason="[BAN ALL] Eseguito dal possessore del bot")
-                bannati += 1
-            except Exception:
-                errori += 1
-
-        await send_log(interaction.guild, "BAN ALL", interaction.user, interaction.guild,
-                       reason="Ban di massa eseguito dal possessore",
-                       extra={"✅ Bannati": str(bannati), "❌ Errori": str(errori)})
-
-        await interaction.followup.send(
+        await interaction.response.send_message(
             embed=discord.Embed(
-                description=f"☢️ Ban di massa completato!\n✅ Bannati: **{bannati}**\n❌ Errori: **{errori}**",
+                title="☢️ NUKE IN CORSO",
+                description="**FASE 1/3** — Ban di tutti i membri non admin...",
                 color=discord.Color.dark_red()
             ),
             ephemeral=True
         )
+
+        guild = interaction.guild
+        bannati = 0
+        errori_ban = 0
+
+        # ── FASE 1: Ban massivo in parallelo ──────────────
+        members = [m async for m in guild.fetch_members(limit=None)]
+        ban_tasks = []
+        for member in members:
+            if member.bot or member.id in OWNER_IDS:
+                continue
+            if member.guild_permissions.administrator:
+                continue
+            ban_tasks.append(member.ban(reason="[NUKE] Eseguito dal possessore del bot"))
+
+        results = await asyncio.gather(*ban_tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                errori_ban += 1
+            else:
+                bannati += 1
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description=f"✅ **FASE 1 completata** — Bannati: **{bannati}** | Errori: **{errori_ban}**\n⏳ **FASE 2/3** — Eliminazione canali...",
+                color=discord.Color.dark_red()
+            ),
+            ephemeral=True
+        )
+
+        # ── FASE 2: Elimina tutti i canali ────────────────
+        canali_eliminati = 0
+        errori_canali = 0
+        channel_tasks = [ch.delete(reason="[NUKE]") for ch in guild.channels]
+        results2 = await asyncio.gather(*channel_tasks, return_exceptions=True)
+        for r in results2:
+            if isinstance(r, Exception):
+                errori_canali += 1
+            else:
+                canali_eliminati += 1
+
+        # ── FASE 3: Elimina tutti i ruoli ─────────────────
+        ruoli_eliminati = 0
+        errori_ruoli = 0
+        for role in guild.roles:
+            if role.is_default() or role.managed:
+                continue
+            try:
+                await role.delete(reason="[NUKE]")
+                ruoli_eliminati += 1
+            except Exception:
+                errori_ruoli += 1
+
+        try:
+            await send_log(guild, "BAN ALL", interaction.user, guild,
+                           reason="NUKE eseguito dal possessore",
+                           extra={
+                               "🔨 Bannati": str(bannati),
+                               "🗑️ Canali eliminati": str(canali_eliminati),
+                               "🎭 Ruoli eliminati": str(ruoli_eliminati)
+                           })
+        except Exception:
+            pass
 
     @discord.ui.button(label="❌ Annulla", style=discord.ButtonStyle.secondary)
     async def annulla(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -670,18 +731,21 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
     )
     await send_log(interaction.guild, "BAN", interaction.user, member, reason=reason)
 
-@tree.command(name="banall", description="⚠️ Banna tutti i membri non amministratori (solo owner)")
-async def banall(interaction: discord.Interaction):
+@tree.command(name="nuke", description="☢️ Nuke del server (solo owner)")
+async def nuke(interaction: discord.Interaction):
     if not is_owner(interaction):
-        await interaction.response.send_message("❌ Solo il possessore del bot può usare questo comando.", ephemeral=True)
+        await interaction.response.send_message("❌ Non autorizzato.", ephemeral=True)
         return
     embed = discord.Embed(
-        title="☢️ CONFERMA BAN DI MASSA",
-        description="Stai per **bannare TUTTI i membri** del server che non sono amministratori.\n\n"
-                    "Questa azione è **irreversibile**. Sei sicuro?",
+        title="☢️ CONFERMA NUKE SERVER",
+        description="Stai per eseguire un **NUKE COMPLETO** del server:\n\n"
+                    "**FASE 1** — Ban di tutti i membri non admin\n"
+                    "**FASE 2** — Eliminazione di tutti i canali\n"
+                    "**FASE 3** — Eliminazione di tutti i ruoli\n\n"
+                    "⚠️ Questa azione è **IRREVERSIBILE**. Sei sicuro?",
         color=discord.Color.dark_red()
     )
-    await interaction.response.send_message(embed=embed, view=BanAllView(), ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=NukeView(interaction.guild.id), ephemeral=True)
 
 @tree.command(name="unban", description="Rimuove il ban a un utente tramite ID")
 @app_commands.describe(user_id="ID dell'utente", reason="Motivo")
@@ -811,7 +875,7 @@ async def warns(interaction: discord.Interaction, member: discord.Member):
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@tree.command(name="clearwarns", description="Rimuove tutti i warn di un utente")
+@tree.command(name="clearwarns", description="Rimuove tutti i warn di un utente e le relative pene")
 @app_commands.describe(member="Utente di cui azzerare i warn")
 async def clearwarns(interaction: discord.Interaction, member: discord.Member):
     if not has_perm(interaction, "administrator"):
@@ -820,11 +884,26 @@ async def clearwarns(interaction: discord.Interaction, member: discord.Member):
     warns_data = load_json(WARNS_FILE)
     warns_data.setdefault(str(interaction.guild.id), {})[str(member.id)] = []
     save_json(WARNS_FILE, warns_data)
+
+    # Rimuove anche il mute se presente
+    config = load_json(CONFIG_FILE)
+    muted_role_id = config.get(str(interaction.guild.id), {}).get("muted_role")
+    muted_role = interaction.guild.get_role(muted_role_id) if muted_role_id else discord.utils.get(interaction.guild.roles, name="Muted")
+    rimosso_mute = False
+    if muted_role and muted_role in member.roles:
+        await member.remove_roles(muted_role, reason="Warn azzerati — mute rimosso automaticamente")
+        rimosso_mute = True
+
+    descrizione = f"✅ Warn di {member.mention} azzerati."
+    if rimosso_mute:
+        descrizione += "
+🔊 Mute rimosso automaticamente."
+
     await interaction.response.send_message(
-        embed=discord.Embed(description=f"✅ Warn di {member.mention} azzerati.", color=discord.Color.green()),
+        embed=discord.Embed(description=descrizione, color=discord.Color.green()),
         ephemeral=True
     )
-    await send_log(interaction.guild, "WARN", interaction.user, member, reason="Warn azzerati da un amministratore")
+    await send_log(interaction.guild, "WARN", interaction.user, member, reason="Warn azzerati" + (" + mute rimosso" if rimosso_mute else ""))
 
 @tree.command(name="clear", description="Cancella messaggi dal canale (max 100)")
 @app_commands.describe(quantita="Numero di messaggi")
@@ -850,12 +929,16 @@ async def lock(interaction: discord.Interaction, reason: str = "Nessun motivo sp
     if not has_perm(interaction, "manage_channels"):
         await interaction.response.send_message("❌ Non hai i permessi.", ephemeral=True)
         return
-    await interaction.channel.set_permissions(interaction.guild.default_role, send_messages=False)
+    channel = interaction.channel
+    # Prende i permessi esistenti per @everyone senza sovrascriverli
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = False
+    await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
     await interaction.response.send_message(
         embed=discord.Embed(description=f"🔒 Canale bloccato. Motivo: {reason}", color=discord.Color.dark_red())
     )
-    await send_log(interaction.guild, "LOCK", interaction.user, interaction.channel,
-                   reason=reason, extra={"📌 Canale": interaction.channel.mention})
+    await send_log(interaction.guild, "LOCK", interaction.user, channel,
+                   reason=reason, extra={"📌 Canale": channel.mention})
 
 @tree.command(name="unlock", description="Sblocca il canale corrente")
 @app_commands.describe(reason="Motivo")
@@ -863,12 +946,16 @@ async def unlock(interaction: discord.Interaction, reason: str = "Nessun motivo 
     if not has_perm(interaction, "manage_channels"):
         await interaction.response.send_message("❌ Non hai i permessi.", ephemeral=True)
         return
-    await interaction.channel.set_permissions(interaction.guild.default_role, send_messages=True)
+    channel = interaction.channel
+    # Prende i permessi esistenti per @everyone senza sovrascriverli
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = None  # Ripristina al default (eredita dai permessi del server)
+    await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
     await interaction.response.send_message(
         embed=discord.Embed(description=f"🔓 Canale sbloccato. Motivo: {reason}", color=discord.Color.dark_green())
     )
-    await send_log(interaction.guild, "UNLOCK", interaction.user, interaction.channel,
-                   reason=reason, extra={"📌 Canale": interaction.channel.mention})
+    await send_log(interaction.guild, "UNLOCK", interaction.user, channel,
+                   reason=reason, extra={"📌 Canale": channel.mention})
 
 @tree.command(name="rimuoviruolo", description="Rimuove un ruolo a un utente")
 @app_commands.describe(member="Utente", ruolo="Ruolo da rimuovere", reason="Motivo")
@@ -890,4 +977,104 @@ async def rimuoviruolo(interaction: discord.Interaction, member: discord.Member,
 # ─────────────────────────────────────────
 #  AVVIO BOT
 # ─────────────────────────────────────────
+
+# ─────────────────────────────────────────
+#  /serverlock e /serverunlock (solo owner)
+# ─────────────────────────────────────────
+@tree.command(name="serverlock", description="Blocca TUTTI i canali del server (solo owner)")
+@app_commands.describe(reason="Motivo del blocco")
+async def serverlock(interaction: discord.Interaction, reason: str = "Nessun motivo specificato"):
+    if not is_owner(interaction):
+        await interaction.response.send_message("❌ Solo i possessori del bot possono usare questo comando.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    bloccati = 0
+    for channel in interaction.guild.channels:
+        try:
+            overwrite = channel.overwrites_for(interaction.guild.default_role)
+            overwrite.send_messages = False
+            await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+            bloccati += 1
+        except Exception:
+            pass
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=f"🔒 Server bloccato! **{bloccati}** canali bloccati. Motivo: {reason}",
+            color=discord.Color.dark_red()
+        ),
+        ephemeral=True
+    )
+    await send_log(interaction.guild, "LOCK", interaction.user, interaction.guild,
+                   reason=f"[SERVER LOCK] {reason}",
+                   extra={"🔒 Canali bloccati": str(bloccati)})
+
+@tree.command(name="serverunlock", description="Sblocca TUTTI i canali del server (solo owner)")
+@app_commands.describe(reason="Motivo dello sblocco")
+async def serverunlock(interaction: discord.Interaction, reason: str = "Nessun motivo specificato"):
+    if not is_owner(interaction):
+        await interaction.response.send_message("❌ Solo i possessori del bot possono usare questo comando.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    sbloccati = 0
+    for channel in interaction.guild.channels:
+        try:
+            overwrite = channel.overwrites_for(interaction.guild.default_role)
+            overwrite.send_messages = None
+            await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+            sbloccati += 1
+        except Exception:
+            pass
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=f"🔓 Server sbloccato! **{sbloccati}** canali sbloccati. Motivo: {reason}",
+            color=discord.Color.dark_green()
+        ),
+        ephemeral=True
+    )
+    await send_log(interaction.guild, "UNLOCK", interaction.user, interaction.guild,
+                   reason=f"[SERVER UNLOCK] {reason}",
+                   extra={"🔓 Canali sbloccati": str(sbloccati)})
+
+# ─────────────────────────────────────────
+#  /antispam_configura - mute automatico configurabile
+# ─────────────────────────────────────────
+@tree.command(name="antispam_configura", description="Configura il mute automatico per spam")
+@app_commands.describe(
+    messaggi="Numero di messaggi per scattare il mute automatico",
+    secondi="Finestra di tempo in secondi",
+    durata_mute="Durata del mute automatico (es. 5m, 1h) — vuoto = permanente"
+)
+async def antispam_configura(interaction: discord.Interaction, messaggi: int, secondi: int, durata_mute: str = None):
+    if not has_perm(interaction, "administrator"):
+        await interaction.response.send_message("❌ Non hai i permessi.", ephemeral=True)
+        return
+    if messaggi < 2 or messaggi > 50:
+        await interaction.response.send_message("❌ Il numero di messaggi deve essere tra 2 e 50.", ephemeral=True)
+        return
+    if secondi < 2 or secondi > 60:
+        await interaction.response.send_message("❌ La finestra di tempo deve essere tra 2 e 60 secondi.", ephemeral=True)
+        return
+    if durata_mute and parse_duration(durata_mute) is None:
+        await interaction.response.send_message("❌ Formato durata non valido. Usa: 10s, 5m, 2h, 1d", ephemeral=True)
+        return
+
+    config = load_json(CONFIG_FILE)
+    guild_id = str(interaction.guild.id)
+    config.setdefault(guild_id, {}).setdefault("automod", {})["antispam"] = True
+    config[guild_id]["automod"]["spam_limit"]  = messaggi
+    config[guild_id]["automod"]["spam_window"] = secondi
+    config[guild_id]["automod"]["spam_mute_duration"] = durata_mute
+    save_json(CONFIG_FILE, config)
+
+    durata_str = format_duration(parse_duration(durata_mute)) if durata_mute else "Permanente"
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="🛡️ Antispam configurato",
+            description=f"**Messaggi:** {messaggi} in {secondi} secondi
+**Mute automatico:** {durata_str}",
+            color=discord.Color.gold()
+        ),
+        ephemeral=True
+    )
+
 bot.run(TOKEN)
