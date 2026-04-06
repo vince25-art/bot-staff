@@ -896,8 +896,7 @@ async def clearwarns(interaction: discord.Interaction, member: discord.Member):
 
     descrizione = f"✅ Warn di {member.mention} azzerati."
     if rimosso_mute:
-        descrizione += "
-🔊 Mute rimosso automaticamente."
+        descrizione += "\n🔊 Mute rimosso automaticamente."
 
     await interaction.response.send_message(
         embed=discord.Embed(description=descrizione, color=discord.Color.green()),
